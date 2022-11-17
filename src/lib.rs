@@ -1,6 +1,6 @@
-//! A library for racing `Future`s and getting ranked results back.
+//! A crate for racing `Future`s and getting ranked results back.
 //!
-//! # Examples
+//! # Example
 //!
 //! ```
 //! use tokio::time::sleep;
