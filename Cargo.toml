@@ -8,13 +8,14 @@ repository = "https://github.com/SeedyROM/speedracer"
 documentation = "https://docs.rs/speedracer"
 readme = "README.md"
 
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 
 [dependencies]
+eyre = "0.6.8"
 futures = "0.3.25"
-tokio = { version = "1.21.2", features = ["time"] }
+tokio = { version = "1.21.2", features = ["rt", "time"] }
 
 [dev-dependencies]
-tokio = { version = "1.21.2", features = ["full"] }
+tokio = { version = "1.21.2", features = ["rt", "time", "macros"] }

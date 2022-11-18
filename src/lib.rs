@@ -2,60 +2,66 @@
 //!
 //! # Example
 //!
-//! ```
+//! ```ignore
 //! use tokio::time::sleep;
 //! use std::time::Duration;
 //!
 //! use speedracer::RaceTrack;
 //!
-//! #[tokio::main]
-//! async fn main() {
-//!    let mut race_track = RaceTrack::disqualify_after(Duration::from_millis(300));
-//!   
-//!    race_track.add_racer("Racer #1", async move {
-//!       sleep(std::time::Duration::from_millis(100)).await;
-//!       Ok(())
-//!    });
-//!    race_track.add_racer("Racer #2", async move {
-//!       sleep(std::time::Duration::from_secs(200)).await;
-//!       Ok(())
-//!    });
-//!    race_track.add_racer("Racer #3", async move {
-//!       sleep(std::time::Duration::from_secs(700)).await;
-//!       Ok(())
-//!    });
-//!   
-//!    race_track.run().await;
-//!    let rankings = race_track.rankings();
-//!   
-//!    assert_eq!(rankings[0].name, "Racer #1");
-//!    assert_eq!(rankings[1].name, "Racer #2");
-//!    assert_eq!(rankings[2].name, "Racer #3");
-//!    assert_eq!(rankings[2].disqualified, true);
-//! }
+//! let mut race_track = RaceTrack::disqualify_after(Duration::from_millis(500));
+//!
+//! race_track.add_racer("Racer #1", async move {
+//!     println!("Racer #1 is starting");
+//!     sleep(std::time::Duration::from_millis(100)).await;
+//!     println!("Racer #1 is ending");
+//!
+//!     Ok(())
+//! });
+//! race_track.add_racer("Racer #2", async move {
+//!     println!("Racer #2 is starting");
+//!     sleep(std::time::Duration::from_secs(200)).await;
+//!     println!("Racer #2 is ending");
+//!
+//!     Ok(())
+//! });
+//! race_track.add_racer("Racer #3", async move {
+//!     println!("Racer #3 is starting");
+//!     sleep(std::time::Duration::from_secs(700)).await;
+//!     println!("Racer #3 is ending");
+//!
+//!     Ok(())
+//! });
+//!
+//! race_track.run().await;
+//! let rankings = race_track.rankings();
+//!
+//! println!("Rankings: {:?}", rankings);
+//!     
+//! assert_eq!(rankings[0].name, "Racer #1");
+//! assert_eq!(rankings[1].name, "Racer #2");
+//! assert_eq!(rankings[2].name, "Racer #3");
+//! assert_eq!(rankings[2].disqualified, true);
 //!
 //! ```
 
-use std::{collections::BTreeMap, pin::Pin, time::Duration};
+use std::{collections::BTreeMap, pin::Pin, sync::Arc, time::Duration};
 
-use futures::Future;
-
-/// Simple type alias for a Boxed `std::error::Error`.
-pub type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
+use eyre::Report;
+use futures::{stream::FuturesUnordered, Future, StreamExt};
 
 /// A wrapper around a `Future`.
 struct Racer<T> {
     name: String,
-    fut: Pin<Box<dyn Future<Output = Result<T, Error>>>>,
+    fut: Pin<Box<dyn Future<Output = Result<T, Report>> + Send + Sync>>,
 }
 
 /// The rank and disqualification status of an executed Racer.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RaceResult<T> {
     pub name: String,
     pub duration: Duration,
     pub disqualified: bool,
-    pub error: Option<Error>,
+    pub error: Option<Arc<Report>>,
     pub value: Option<T>,
 }
 
@@ -78,7 +84,7 @@ impl<T> Default for RaceTrack<T> {
 
 impl<T> RaceTrack<T>
 where
-    T: Clone + Send + Sync,
+    T: std::fmt::Debug + Clone + Send + Sync + 'static,
 {
     /// Create a new `RaceTrack` with specified timeout.
     pub fn disqualify_after(timeout: Duration) -> Self {
@@ -91,7 +97,7 @@ where
     /// Add a `Future` to the `RaceTrack`.
     pub fn add_racer<F>(&mut self, name: impl Into<String>, fut: F)
     where
-        F: Future<Output = Result<T, Error>> + 'static,
+        F: Future<Output = Result<T, Report>> + Send + Sync + 'static,
     {
         self.racers.push(Racer {
             name: name.into(),
@@ -101,23 +107,24 @@ where
 
     /// Run the `RaceTrack` and collect the rankings.
     pub async fn run(&mut self) {
+        let racers = std::mem::take(&mut self.racers);
+
         // Clear the rankings from the previous run.
         self.rankings.clear();
 
         // Run the racers.
-        let mut tasks = Vec::new();
-        for racer in self.racers.iter_mut() {
+        let mut tasks = FuturesUnordered::new();
+        for racer in racers {
             let name = racer.name.clone();
             let timeout = self.timeout;
-            tasks.push(async move {
+            tasks.push(tokio::spawn(async move {
                 let start = std::time::Instant::now();
-                let fut = racer.fut.as_mut();
-                let res = tokio::time::timeout(timeout, fut).await;
+                let res = tokio::time::timeout(timeout, racer.fut).await;
                 let duration = start.elapsed();
                 let disqualified = res.is_err();
 
                 // Do some magic on the timeout error and then split the result!
-                let result = res.unwrap_or_else(|_| Err("Racer timed out".into()));
+                let result = res.unwrap_or_else(|_| Err(eyre::eyre!("Racer timed out")));
                 let (value, error) = match result {
                     Ok(value) => (Some(value), None),
                     Err(error) => (None, Some(error)),
@@ -127,23 +134,23 @@ where
                     name,
                     duration,
                     disqualified,
-                    error,
+                    error: error.map(Arc::new),
                     value,
                 }
-            });
+            }));
         }
 
         // RaceResult em up!
         let mut i = 0;
-        for result in futures::future::join_all(tasks).await {
-            self.rankings.insert(i, result);
+        while let Some(result) = tasks.next().await {
+            self.rankings.insert(i, result.unwrap());
             i += 1;
         }
     }
 
     /// Get the rankings for the previous `RaceTrack` run.
-    pub fn rankings(&self) -> Vec<&RaceResult<T>> {
-        self.rankings.values().into_iter().collect()
+    pub fn rankings(&self) -> Vec<RaceResult<T>> {
+        self.rankings.values().cloned().collect()
     }
 }
 
