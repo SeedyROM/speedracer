@@ -52,7 +52,7 @@ use futures::{stream::FuturesUnordered, Future, StreamExt};
 /// A wrapper around a `Future`.
 struct Racer<T> {
     name: String,
-    fut: Pin<Box<dyn Future<Output = Result<T, Report>> + Send + Sync>>,
+    fut: Pin<Box<dyn Future<Output = Result<T, Report>> + Send>>,
 }
 
 /// The rank and disqualification status of an executed Racer.
@@ -84,7 +84,7 @@ impl<T> Default for RaceTrack<T> {
 
 impl<T> RaceTrack<T>
 where
-    T: std::fmt::Debug + Clone + Send + Sync + 'static,
+    T: std::fmt::Debug + Clone + Send + 'static,
 {
     /// Create a new `RaceTrack` with specified timeout.
     pub fn disqualify_after(timeout: Duration) -> Self {
@@ -97,7 +97,7 @@ where
     /// Add a `Future` to the `RaceTrack`.
     pub fn add_racer<F>(&mut self, name: impl Into<String>, fut: F)
     where
-        F: Future<Output = Result<T, Report>> + Send + Sync + 'static,
+        F: Future<Output = Result<T, Report>> + Send + 'static,
     {
         self.racers.push(Racer {
             name: name.into(),
@@ -118,16 +118,23 @@ where
             let name = racer.name.clone();
             let timeout = self.timeout;
             tasks.push(tokio::spawn(async move {
+                // Start the racer and time it.
                 let start = std::time::Instant::now();
                 let res = tokio::time::timeout(timeout, racer.fut).await;
                 let duration = start.elapsed();
-                let disqualified = res.is_err();
+
+                // Disqualify the racer if it timed out.
+                let mut disqualified = res.is_err();
 
                 // Do some magic on the timeout error and then split the result!
                 let result = res.unwrap_or_else(|_| Err(eyre::eyre!("Racer timed out")));
                 let (value, error) = match result {
                     Ok(value) => (Some(value), None),
-                    Err(error) => (None, Some(error)),
+                    Err(error) => {
+                        // Disqualify the racer if it errored.
+                        disqualified = true;
+                        (None, Some(error))
+                    },
                 };
 
                 RaceResult {
@@ -159,6 +166,7 @@ mod tests {
     use std::time::Duration;
 
     use tokio::time::sleep;
+    use eyre::eyre;
 
     use super::*;
 
@@ -182,28 +190,42 @@ mod tests {
             sleep(Duration::from_millis(25)).await;
             Ok(4)
         });
+        race_track.add_racer("Racer #5", async move {
+            Err(eyre!("Racer #5 failed!"))
+        });
 
         race_track.run().await;
         let rankings = race_track.rankings();
 
-        assert_eq!(rankings[0].name, "Racer #1");
-        assert_eq!(rankings[0].disqualified, false);
-        assert_eq!(rankings[0].value, Some(1));
+        println!("{:#?}", rankings);
 
-        assert_eq!(rankings[1].name, "Racer #2");
-        assert_eq!(rankings[1].disqualified, false);
-        assert_eq!(rankings[1].value, Some(2));
-
-        assert_eq!(rankings[2].name, "Racer #3");
-        assert_eq!(rankings[2].disqualified, false);
-        assert_eq!(rankings[2].value, Some(3));
-
-        assert_eq!(rankings[3].name, "Racer #4");
-        assert_eq!(rankings[3].disqualified, true);
+        assert_eq!(rankings[0].value, None);
+        assert_eq!(rankings[0].name, "Racer #5");
+        assert_eq!(rankings[0].disqualified, true);
         assert_eq!(
-            rankings[3].error.as_ref().unwrap().to_string(),
+            rankings[0].error.as_ref().unwrap().to_string(),
+            "Racer #5 failed!"
+        );
+        assert_eq!(rankings[0].value, None);
+
+        assert_eq!(rankings[1].name, "Racer #1");
+        assert_eq!(rankings[1].disqualified, false);
+        assert_eq!(rankings[1].value, Some(1));
+
+        assert_eq!(rankings[2].name, "Racer #2");
+        assert_eq!(rankings[2].disqualified, false);
+        assert_eq!(rankings[2].value, Some(2));
+
+        assert_eq!(rankings[3].name, "Racer #3");
+        assert_eq!(rankings[3].disqualified, false);
+        assert_eq!(rankings[3].value, Some(3));
+
+        assert_eq!(rankings[4].name, "Racer #4");
+        assert_eq!(rankings[4].disqualified, true);
+        assert_eq!(
+            rankings[4].error.as_ref().unwrap().to_string(),
             "Racer timed out"
         );
-        assert_eq!(rankings[3].value, None);
+        assert_eq!(rankings[4].value, None);
     }
 }
